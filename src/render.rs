@@ -1,6 +1,7 @@
 use std::thread;
 
 use crate::decode::Image;
+use crate::menu::Menu;
 use crate::view::Placement;
 
 const BACKGROUND: u32 = 0x1e1e1e;
@@ -35,39 +36,65 @@ pub fn draw(buf: &mut [u32], bw: u32, bh: u32, image: Option<&Image>, p: Placeme
         (&img.pixels[..], img.width, img.height, p.zoom)
     };
 
-    // Nearest source index for each screen pixel center.
-    let map = |n: u32, origin: f64, len: u32| -> Vec<u32> {
+    // Nearest displayed-image position for each screen pixel center.
+    let (dw, dh) = p.orientation.display_size((sw as f64, sh as f64));
+    let map = |n: u32, origin: f64, len: f64| -> Vec<u32> {
         (0..n)
             .map(|i| {
                 let u = ((i as f64 + 0.5 - origin) / scale).floor();
-                if u >= 0.0 && u < len as f64 { u as u32 } else { OUTSIDE }
+                if u >= 0.0 && u < len { u as u32 } else { OUTSIDE }
             })
             .collect()
     };
-    let xmap = map(bw, p.x, sw);
-    let ymap = map(bh, p.y, sh);
-    let Some(x0) = xmap.iter().position(|&x| x != OUTSIDE) else { return };
-    let x1 = xmap.iter().rposition(|&x| x != OUTSIDE).unwrap() + 1;
-    let xmap = &xmap[x0..x1];
+    let umap = map(bw, p.x, dw);
+    let vmap = map(bh, p.y, dh);
+    let Some(x0) = umap.iter().position(|&u| u != OUTSIDE) else { return };
+    let x1 = umap.iter().rposition(|&u| u != OUTSIDE).unwrap() + 1;
+    let umap = &umap[x0..x1];
 
-    for (y, &sy) in ymap.iter().enumerate() {
-        if sy == OUTSIDE {
+    // Source pixel index for displayed position (u, v). Every orientation maps
+    // a displayed row to a straight line through the source, so per row it's
+    // `base + u * step`.
+    let source_index = |u: f64, v: f64| {
+        let (x, y) = p.orientation.to_source((u + 0.5, v + 0.5), (sw as f64, sh as f64));
+        y.floor() as isize * sw as isize + x.floor() as isize
+    };
+
+    for (y, &v) in vmap.iter().enumerate() {
+        if v == OUTSIDE {
             continue;
         }
-        let srow = &src[sy as usize * sw as usize..][..sw as usize];
-        let drow = &mut buf[y * bw as usize + x0..][..xmap.len()];
+        let base = source_index(0.0, v as f64);
+        let step = source_index(1.0, v as f64) - base;
+        let pixel = |u: u32| src[(base + u as isize * step) as usize];
+        let drow = &mut buf[y * bw as usize + x0..][..umap.len()];
         if !img.has_alpha {
-            for (d, &sx) in drow.iter_mut().zip(xmap) {
-                *d = srow[sx as usize] & 0x00ff_ffff;
+            for (d, &u) in drow.iter_mut().zip(umap) {
+                *d = pixel(u) & 0x00ff_ffff;
             }
             continue;
         }
         let cy = y as u32 >> CHECKER_SIZE_LOG2;
-        for (x, (d, &sx)) in drow.iter_mut().zip(xmap).enumerate() {
+        for (x, (d, &u)) in drow.iter_mut().zip(umap).enumerate() {
             let cx = (x0 + x) as u32 >> CHECKER_SIZE_LOG2;
             let bg = if (cx + cy) & 1 == 0 { CHECKER_LIGHT } else { CHECKER_DARK };
-            *d = blend(srow[sx as usize], bg);
+            *d = blend(pixel(u), bg);
         }
+    }
+}
+
+/// Copies an opaque overlay (the menu) onto the buffer at (`x`, `y`), clipped to the buffer.
+pub fn draw_overlay(buf: &mut [u32], bw: u32, bh: u32, menu: &Menu) {
+    let x0 = menu.x.clamp(0, bw as i32) as usize;
+    let x1 = (menu.x + menu.width as i32).clamp(0, bw as i32) as usize;
+    for row in 0..menu.height as i32 {
+        let y = menu.y + row;
+        if y < 0 || y >= bh as i32 || x0 >= x1 {
+            continue;
+        }
+        let src = &menu.pixels[row as usize * menu.width as usize..][..menu.width as usize];
+        let skip = (x0 as i32 - menu.x) as usize;
+        buf[y as usize * bw as usize + x0..y as usize * bw as usize + x1].copy_from_slice(&src[skip..skip + (x1 - x0)]);
     }
 }
 

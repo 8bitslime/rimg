@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fontdue = "0.9.4"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tga", "pnm", "qoi", "hdr", "exr", "dds", "ff", "avif-native"] }
 jxl-oxide = "0.12.6"
 libheif-rs = "3.0.0"

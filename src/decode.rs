@@ -194,7 +194,7 @@ fn decode_heif(data: &[u8]) -> Result<Image> {
     let (width, height) = (plane.width, plane.height);
     let mut pixels = Vec::with_capacity(width as usize * height as usize);
     for row in plane.data.chunks(plane.stride).take(height as usize) {
-        pixels.extend(row[..width as usize * 4].chunks_exact(4).map(|c| pack([c[0], c[1], c[2], c[3]])));
+        pixels.extend(row[..width as usize * 4].as_chunks::<4>().0.iter().map(|&c| pack(c)));
     }
     Ok(Image::new(width, height, pixels, has_alpha))
 }

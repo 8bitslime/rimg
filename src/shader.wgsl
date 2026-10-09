@@ -3,6 +3,11 @@
 struct Params {
     // Tile corners in clip space: x0, y0, x1, y1.
     rect: vec4<f32>,
+    // Texture coordinates at the quad's top-left corner (xy), and their change
+    // across its width (zw); rotation and mirroring live here.
+    uv: vec4<f32>,
+    // Change in texture coordinates down the quad's height (xy).
+    uv_down: vec4<f32>,
     // x: 1 if the image has alpha (draw a checkerboard behind it),
     // y: 1 if the surface is sRGB (shader output must be linear),
     // z: checkerboard cell size in pixels.
@@ -24,7 +29,7 @@ fn vs_image(@builtin(vertex_index) i: u32) -> VsOut {
     let corner = vec2<f32>(f32(i & 1u), f32(i >> 1u));
     var out: VsOut;
     out.pos = vec4<f32>(mix(params.rect.xy, params.rect.zw, corner), 0.0, 1.0);
-    out.uv = corner;
+    out.uv = params.uv.xy + corner.x * params.uv.zw + corner.y * params.uv_down.xy;
     return out;
 }
 

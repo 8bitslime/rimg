@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Waker};
 use winit::window::Window;
 
 use crate::decode::Image;
+use crate::menu::Menu;
 use crate::view::Placement;
 
 /// Background gray; matches `render::BACKGROUND`.
@@ -21,7 +22,7 @@ const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 /// Surface format the image pipeline is compiled for up front; the common case on all backends.
 const LIKELY_SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 /// Bytes of the `Params` uniform in shader.wgsl.
-const PARAMS_SIZE: u64 = 32;
+const PARAMS_SIZE: u64 = 64;
 
 /// Device and pipelines, created off the main thread.
 pub struct GpuContext {
@@ -276,12 +277,19 @@ struct Uploaded {
     has_alpha: bool,
 }
 
+/// The menu's texture, drawn over the image.
+struct Overlay {
+    tile: Tile,
+    version: u64,
+}
+
 pub struct Renderer {
     ctx: GpuContext,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     image: Option<Uploaded>,
+    overlay: Option<Overlay>,
 }
 
 impl Renderer {
@@ -315,7 +323,7 @@ impl Renderer {
         if format != LIKELY_SURFACE_FORMAT {
             ctx.image_pipeline = create_image_pipeline(&ctx.device, &ctx.image_pipeline_layout, &ctx.shader, format);
         }
-        Ok(Renderer { ctx, window, surface, config, image: None })
+        Ok(Renderer { ctx, window, surface, config, image: None, overlay: None })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -336,7 +344,7 @@ impl Renderer {
             up.has_alpha = img.has_alpha;
             let up = self.image.as_ref().unwrap();
             for tile in &up.tiles {
-                self.write_tile(&mut encoder, tile, img);
+                self.write_tile(&mut encoder, tile, img.width, &img.pixels);
             }
             self.ctx.queue.submit([encoder.finish()]);
             return;
@@ -349,37 +357,8 @@ impl Renderer {
             for x in (0..img.width).step_by(max as usize) {
                 let (width, height) = ((img.width - x).min(max), (img.height - y).min(max));
                 let mip_level_count = 32 - width.max(height).leading_zeros();
-                let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-                let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("image"),
-                    size,
-                    mip_level_count,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: IMAGE_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                });
-                let params = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("params"),
-                    size: PARAMS_SIZE,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let view = texture.create_view(&Default::default());
-                let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("image"),
-                    layout: &self.ctx.image_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.ctx.image_sampler) },
-                        wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
-                    ],
-                });
-                let tile = Tile { x, y, width, height, texture, params, bind_group };
-                self.write_tile(&mut encoder, &tile, img);
+                let tile = self.create_tile(x, y, width, height, mip_level_count);
+                self.write_tile(&mut encoder, &tile, img.width, &img.pixels);
                 tiles.push(tile);
             }
         }
@@ -387,8 +366,38 @@ impl Renderer {
         self.image = Some(Uploaded { width: img.width, height: img.height, tiles, has_alpha: img.has_alpha });
     }
 
-    /// Copies the tile's region of `img` into its texture and rebuilds the mips.
-    fn write_tile(&self, encoder: &mut wgpu::CommandEncoder, tile: &Tile, img: &Image) {
+    fn create_tile(&self, x: u32, y: u32, width: u32, height: u32, mip_level_count: u32) -> Tile {
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("image"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: IMAGE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let params = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params"),
+            size: PARAMS_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image"),
+            layout: &self.ctx.image_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.ctx.image_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+            ],
+        });
+        Tile { x, y, width, height, texture, params, bind_group }
+    }
+
+    /// Copies the tile's region of a `src_width`-wide pixel buffer into its texture and rebuilds the mips.
+    fn write_tile(&self, encoder: &mut wgpu::CommandEncoder, tile: &Tile, src_width: u32, pixels: &[u32]) {
         self.ctx.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tile.texture,
@@ -396,10 +405,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            pixel_bytes(&img.pixels),
+            pixel_bytes(pixels),
             wgpu::TexelCopyBufferLayout {
-                offset: (tile.y as u64 * img.width as u64 + tile.x as u64) * 4,
-                bytes_per_row: Some(img.width * 4),
+                offset: (tile.y as u64 * src_width as u64 + tile.x as u64) * 4,
+                bytes_per_row: Some(src_width * 4),
                 rows_per_image: Some(tile.height),
             },
             wgpu::Extent3d { width: tile.width, height: tile.height, depth_or_array_layers: 1 },
@@ -442,7 +451,25 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, placement: Placement) {
+    /// Uploads the menu if it changed since the last call; `None` hides it.
+    pub fn set_overlay(&mut self, menu: Option<&Menu>) {
+        let Some(menu) = menu else {
+            self.overlay = None;
+            return;
+        };
+        if self.overlay.as_ref().is_some_and(|o| o.version == menu.version) {
+            return;
+        }
+        let reuse = self.overlay.take().filter(|o| (o.tile.width, o.tile.height) == (menu.width, menu.height));
+        let tile = reuse.map_or_else(|| self.create_tile(0, 0, menu.width, menu.height, 1), |o| o.tile);
+        let mut encoder = self.ctx.device.create_command_encoder(&Default::default());
+        self.write_tile(&mut encoder, &tile, menu.width, &menu.pixels);
+        self.ctx.queue.submit([encoder.finish()]);
+        self.overlay = Some(Overlay { tile, version: menu.version });
+    }
+
+    pub fn render(&mut self, placement: Placement, menu: Option<&Menu>) {
+        self.set_overlay(menu);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -463,17 +490,36 @@ impl Renderer {
 
         if let Some(img) = &self.image {
             // Whole pixels at the image origin keep 1:1 zoom from sampling between texels.
-            let (ox, oy, zoom) = (placement.x.round() as f32, placement.y.round() as f32, placement.zoom as f32);
+            let (ox, oy, zoom) = (placement.x.round(), placement.y.round(), placement.zoom);
+            let o = placement.orientation;
+            let src = (img.width as f64, img.height as f64);
             for tile in &img.tiles {
-                let x0 = ox + tile.x as f32 * zoom;
-                let y0 = oy + tile.y as f32 * zoom;
-                let x1 = x0 + tile.width as f32 * zoom;
-                let y1 = y0 + tile.height as f32 * zoom;
+                // The tile's rectangle on the displayed image.
+                let (tx0, ty0) = (tile.x as f64, tile.y as f64);
+                let (tx1, ty1) = (tx0 + tile.width as f64, ty0 + tile.height as f64);
+                let (a, b) = (o.to_display((tx0, ty0), src), o.to_display((tx1, ty1), src));
+                let (u0, v0, u1, v1) = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+                // Texture coordinates at three of its corners.
+                let uv = |u: f64, v: f64| {
+                    let (x, y) = o.to_source((u, v), src);
+                    ((x - tx0) / tile.width as f64, (y - ty0) / tile.height as f64)
+                };
+                let (top_left, top_right, bottom_left) = (uv(u0, v0), uv(u1, v0), uv(u0, v1));
+                let (x0, y0) = (ox + u0 * zoom, oy + v0 * zoom);
+                let (x1, y1) = (ox + u1 * zoom, oy + v1 * zoom);
                 let params = [
-                    x0 / ww * 2.0 - 1.0,
-                    1.0 - y0 / wh * 2.0,
-                    x1 / ww * 2.0 - 1.0,
-                    1.0 - y1 / wh * 2.0,
+                    x0 as f32 / ww * 2.0 - 1.0,
+                    1.0 - y0 as f32 / wh * 2.0,
+                    x1 as f32 / ww * 2.0 - 1.0,
+                    1.0 - y1 as f32 / wh * 2.0,
+                    top_left.0 as f32,
+                    top_left.1 as f32,
+                    (top_right.0 - top_left.0) as f32,
+                    (top_right.1 - top_left.1) as f32,
+                    (bottom_left.0 - top_left.0) as f32,
+                    (bottom_left.1 - top_left.1) as f32,
+                    0.0,
+                    0.0,
                     if img.has_alpha { 1.0 } else { 0.0 },
                     if srgb { 1.0 } else { 0.0 },
                     CHECKER_SIZE,
@@ -482,6 +528,32 @@ impl Renderer {
                 let bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
                 self.ctx.queue.write_buffer(&tile.params, 0, &bytes);
             }
+        }
+
+        if let (Some(overlay), Some(menu)) = (&self.overlay, menu) {
+            // Drawn opaque at whole pixels, so it samples texels 1:1.
+            let (x0, y0) = (menu.x as f32, menu.y as f32);
+            let (x1, y1) = (x0 + menu.width as f32, y0 + menu.height as f32);
+            let params = [
+                x0 / ww * 2.0 - 1.0,
+                1.0 - y0 / wh * 2.0,
+                x1 / ww * 2.0 - 1.0,
+                1.0 - y1 / wh * 2.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                if srgb { 1.0 } else { 0.0 },
+                CHECKER_SIZE,
+                0.0,
+            ];
+            let bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.ctx.queue.write_buffer(&overlay.tile.params, 0, &bytes);
         }
 
         let mut encoder = self.ctx.device.create_command_encoder(&Default::default());
@@ -500,12 +572,16 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
+            pass.set_pipeline(&self.ctx.image_pipeline);
             if let Some(img) = &self.image {
-                pass.set_pipeline(&self.ctx.image_pipeline);
                 for tile in &img.tiles {
                     pass.set_bind_group(0, &tile.bind_group, &[]);
                     pass.draw(0..4, 0..1);
                 }
+            }
+            if let (Some(overlay), Some(_)) = (&self.overlay, menu) {
+                pass.set_bind_group(0, &overlay.tile.bind_group, &[]);
+                pass.draw(0..4, 0..1);
             }
         }
         self.ctx.queue.submit([encoder.finish()]);

@@ -1,5 +1,6 @@
-//! Zoom and pan state, independent of how the image gets drawn.
-//! All coordinates are physical window pixels.
+//! Zoom, pan and orientation state, independent of how the image gets drawn.
+//! All coordinates are physical window pixels. Sizes passed in are the image as
+//! displayed, i.e. after `Orientation::display_size`.
 
 pub const MAX_ZOOM: f64 = 64.0;
 /// Screen pixels of the image that panning always leaves visible.
@@ -8,12 +9,65 @@ const MIN_VISIBLE: f64 = 64.0;
 const MIN_SIZE: f64 = 32.0;
 
 /// Where the image lands on screen: `zoom` screen pixels per image pixel,
-/// with the image's top-left corner at (`x`, `y`).
+/// with the displayed image's top-left corner at (`x`, `y`).
 #[derive(Clone, Copy)]
 pub struct Placement {
     pub zoom: f64,
     pub x: f64,
     pub y: f64,
+    pub orientation: Orientation,
+}
+
+/// How the image is turned on screen: mirrored horizontally if `flip`, then
+/// rotated clockwise by `turns` quarter turns. Display only; files are untouched.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Orientation {
+    pub turns: u8,
+    pub flip: bool,
+}
+
+impl Orientation {
+    pub fn display_size(self, (w, h): Size) -> Size {
+        if self.turns % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// Maps a point on the displayed image to the source image, both in image pixels.
+    /// `src` is the source image size.
+    pub fn to_source(self, (u, v): (f64, f64), (w, h): Size) -> (f64, f64) {
+        let (x, y) = match self.turns {
+            0 => (u, v),
+            1 => (v, h - u),
+            2 => (w - u, h - v),
+            _ => (w - v, u),
+        };
+        if self.flip { (w - x, y) } else { (x, y) }
+    }
+
+    /// Maps a point on the source image to the displayed image; inverse of `to_source`.
+    pub fn to_display(self, (x, y): (f64, f64), (w, h): Size) -> (f64, f64) {
+        let x = if self.flip { w - x } else { x };
+        match self.turns {
+            0 => (x, y),
+            1 => (h - y, x),
+            2 => (w - x, h - y),
+            _ => (y, w - x),
+        }
+    }
+
+    fn rotated(self, clockwise: bool) -> Self {
+        Orientation { turns: (self.turns + if clockwise { 1 } else { 3 }) % 4, ..self }
+    }
+
+    /// Mirrors what's on screen left-to-right. On a quarter-turned image that's
+    /// a vertical mirror of the source, i.e. a horizontal one plus a half turn.
+    fn flipped_horizontally(self) -> Self {
+        let turns = if self.turns % 2 == 1 { (self.turns + 2) % 4 } else { self.turns };
+        Orientation { turns, flip: !self.flip }
+    }
+
+    fn flipped_vertically(self) -> Self {
+        self.flipped_horizontally().rotated(true).rotated(true)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -30,6 +84,11 @@ pub struct View {
     mode: Mode,
     zoom: f64,
     offset: (f64, f64),
+    /// Clockwise quarter turns, kept apart from the mirrors so flips can be
+    /// reset without undoing rotation.
+    turns: u8,
+    /// Mirrors applied to what's on screen after rotating: (horizontal, vertical).
+    mirrored: (bool, bool),
 }
 
 type Size = (f64, f64);
@@ -46,16 +105,52 @@ fn fit_zoom(win: Size, img: Size) -> f64 {
 
 impl View {
     pub fn new() -> View {
-        View { mode: Mode::Fit, zoom: 1.0, offset: (0.0, 0.0) }
+        View { mode: Mode::Fit, zoom: 1.0, offset: (0.0, 0.0), turns: 0, mirrored: (false, false) }
+    }
+
+    pub fn orientation(&self) -> Orientation {
+        let mut o = Orientation { turns: self.turns, flip: false };
+        if self.mirrored.0 {
+            o = o.flipped_horizontally();
+        }
+        if self.mirrored.1 {
+            o = o.flipped_vertically();
+        }
+        o
     }
 
     pub fn placement(&self, win: Size, img: Size) -> Placement {
-        let centered = |zoom: f64| Placement { zoom, x: (win.0 - img.0 * zoom) / 2.0, y: (win.1 - img.1 * zoom) / 2.0 };
+        let orientation = self.orientation();
+        let centered = |zoom: f64| Placement {
+            zoom,
+            x: (win.0 - img.0 * zoom) / 2.0,
+            y: (win.1 - img.1 * zoom) / 2.0,
+            orientation,
+        };
         match self.mode {
             Mode::Fit => centered(fit_zoom(win, img)),
             Mode::Fill => centered(fill_zoom(win, img).min(MAX_ZOOM)),
-            Mode::Manual => Placement { zoom: self.zoom, x: self.offset.0, y: self.offset.1 },
+            Mode::Manual => Placement { zoom: self.zoom, x: self.offset.0, y: self.offset.1, orientation },
         }
+    }
+
+    /// Turns the image a quarter turn. `img` is the displayed size before turning.
+    /// A zoomed or panned image keeps its zoom and is re-centered.
+    pub fn rotate(&mut self, clockwise: bool, win: Size, img: Size) {
+        self.turns = (self.turns + if clockwise { 1 } else { 3 }) % 4;
+        // Turning a mirrored image a quarter turn is the same as turning it and
+        // then mirroring along the other axis.
+        self.mirrored = (self.mirrored.1, self.mirrored.0);
+        let img = (img.1, img.0);
+        self.offset = ((win.0 - img.0 * self.zoom) / 2.0, (win.1 - img.1 * self.zoom) / 2.0);
+    }
+
+    pub fn flip_horizontally(&mut self) {
+        self.mirrored.0 = !self.mirrored.0;
+    }
+
+    pub fn flip_vertically(&mut self) {
+        self.mirrored.1 = !self.mirrored.1;
     }
 
     /// Multiplies zoom by `factor`, keeping the image point under `anchor` fixed.
@@ -90,12 +185,15 @@ impl View {
         self.mode = Mode::Fit;
     }
 
+    /// Also undoes any flips; rotation stays.
     pub fn fill(&mut self) {
         self.mode = Mode::Fill;
+        self.mirrored = (false, false);
     }
 
-    /// Shows the image centered at 100%.
+    /// Shows the image centered at 100%, undoing any flips; rotation stays.
     pub fn actual_size(&mut self, win: Size, img: Size) {
+        self.mirrored = (false, false);
         self.mode = Mode::Manual;
         self.zoom = 1.0;
         self.offset = ((win.0 - img.0) / 2.0, (win.1 - img.1) / 2.0);
@@ -223,5 +321,95 @@ mod tests {
         assert_eq!((p.zoom, p.x, p.y), (0.2, 0.0, 100.0));
         let p = v.placement((800.0, 100.0), SMALL); // height limits, 1x
         assert_eq!((p.zoom, p.x, p.y), (1.0, 300.0, 0.0));
+    }
+
+    /// Where a source pixel's center lands on the displayed image, by brute force.
+    fn displayed_position(o: Orientation, src: Size, (x, y): (f64, f64)) -> (f64, f64) {
+        let (dw, dh) = o.display_size(src);
+        for v in 0..dh as usize {
+            for u in 0..dw as usize {
+                let (sx, sy) = o.to_source((u as f64 + 0.5, v as f64 + 0.5), src);
+                if (sx.floor(), sy.floor()) == (x, y) {
+                    return (u as f64, v as f64);
+                }
+            }
+        }
+        panic!("source pixel ({x}, {y}) not displayed");
+    }
+
+    #[test]
+    fn orientation_moves_corners_where_expected() {
+        let src = (4.0, 2.0);
+        let top_left = (0.0, 0.0);
+        let top_right = (3.0, 0.0);
+        let cw = Orientation::default().rotated(true);
+        assert_eq!(cw.display_size(src), (2.0, 4.0));
+        assert_eq!(displayed_position(cw, src, top_left), (1.0, 0.0)); // goes to the top-right
+        assert_eq!(displayed_position(cw, src, top_right), (1.0, 3.0)); // goes to the bottom-right
+        let ccw = Orientation::default().rotated(false);
+        assert_eq!(displayed_position(ccw, src, top_left), (0.0, 3.0)); // goes to the bottom-left
+        let mirrored = Orientation::default().flipped_horizontally();
+        assert_eq!(displayed_position(mirrored, src, top_left), (3.0, 0.0));
+        let upside_down = Orientation::default().flipped_vertically();
+        assert_eq!(displayed_position(upside_down, src, top_left), (0.0, 1.0));
+    }
+
+    #[test]
+    fn flips_mirror_the_screen_even_when_rotated() {
+        let src = (4.0, 2.0);
+        let cw = Orientation::default().rotated(true);
+        let (dw, dh) = cw.display_size(src);
+        for pixel in [(0.0, 0.0), (3.0, 0.0), (2.0, 1.0)] {
+            let (u, v) = displayed_position(cw, src, pixel);
+            assert_eq!(displayed_position(cw.flipped_horizontally(), src, pixel), (dw - 1.0 - u, v));
+            assert_eq!(displayed_position(cw.flipped_vertically(), src, pixel), (u, dh - 1.0 - v));
+        }
+        let o = cw.flipped_horizontally();
+        assert_eq!(o.flipped_horizontally(), cw);
+        assert_eq!(cw.rotated(true).rotated(true).rotated(true).rotated(true), cw);
+    }
+
+    #[test]
+    fn to_display_inverts_to_source() {
+        let src = (4.0, 2.0);
+        for turns in 0..4 {
+            for flip in [false, true] {
+                let o = Orientation { turns, flip };
+                let p = (1.25, 0.5);
+                let (x, y) = o.to_source(o.to_display(p, src), src);
+                assert!((x - p.0).abs() < 1e-12 && (y - p.1).abs() < 1e-12, "{o:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rotating_a_flipped_image_matches_flipping_a_rotated_one() {
+        // Flip, then rotate...
+        let mut a = View::new();
+        a.flip_horizontally();
+        a.rotate(true, WIN, BIG);
+        // ...looks the same as rotating, then flipping along the other axis.
+        let mut b = View::new();
+        b.rotate(true, WIN, BIG);
+        b.flip_vertically();
+        assert_eq!(a.orientation(), b.orientation());
+    }
+
+    #[test]
+    fn fill_and_actual_size_reset_flips_but_keep_rotation() {
+        let rotated = {
+            let mut v = View::new();
+            v.rotate(true, WIN, BIG);
+            v.orientation()
+        };
+        for reset in [View::fill as fn(&mut View), |v: &mut View| v.actual_size(WIN, BIG)] {
+            let mut v = View::new();
+            v.rotate(true, WIN, BIG);
+            v.flip_horizontally();
+            v.flip_vertically();
+            assert_ne!(v.orientation(), rotated);
+            reset(&mut v);
+            assert_eq!(v.orientation(), rotated);
+        }
     }
 }
